@@ -166,12 +166,11 @@ def evaluate_and_save(test_list, preds, outdir: str):
         pred_sg = savgol_filter(p, window_length=min(51, len(p)//2*2+1), polyorder=3)
         
         plt.figure(figsize=(12,5))
-        plt.plot(y, label='True SOC', lw=2, alpha=0.8)
-        plt.plot(pred_sg, label='Pred SOC', lw=2, alpha=0.8)
+        plt.plot(y, label='True SOC', lw=2)
+        plt.plot(pred_sg, label='Pred SOC', lw=2)
         plt.title(f"LSTM SOC Estimation - {d['file']}")
         plt.xlabel("Timestep"); plt.ylabel("SOC (0~1)")
         plt.grid(alpha=0.3); plt.legend()
-        plt.ylim(0, 1)
         
         plt.savefig(os.path.join(outdir, f"{os.path.splitext(d['file'])[0]}.png"),
                     dpi=200, bbox_inches='tight')

@@ -15,23 +15,44 @@ from mamba import Mamba, MambaConfig
 from scipy.signal import savgol_filter
 
 
-# -------------------------
-# Model (mirror training)
-# -------------------------
 class Net(nn.Module):
     def __init__(self, in_dim, out_dim, hidden, layers):
         super().__init__()
         self.config = MambaConfig(d_model=hidden, n_layers=layers)
-        self.net = nn.Sequential(
+        
+        self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            Mamba(self.config),
-            nn.Linear(hidden, out_dim),
+            nn.LayerNorm(hidden),
+            nn.GELU()
+        )
+        
+        self.mamba = Mamba(self.config)
+        
+        self.feature_refine = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, out_dim),
             nn.Sigmoid()
         )
 
-    def forward(self, x):                 # x: (B, L, F)
-        y = self.net(x)                   # (B, L, 1)
-        return y[..., 0]                  # (B, L)
+    def forward(self, x):  # x: (B, L, F)
+        h = self.input_proj(x)  # (B, L, H)
+        
+        h_mamba = self.mamba(h)  # (B, L, H)
+        
+        h = h + h_mamba
+        
+        h = self.feature_refine(h)  # (B, L, H)
+        
+        y = self.output_proj(h)  # (B, L, 1)
+        return y[..., 0]   # (B, L)
 
 
 # -------------------------
@@ -45,19 +66,26 @@ def find_csvs(folder: str):
 
 
 def read_one_csv(path: str, has_true_label: bool = True):
+
     df = pd.read_csv(path)
     
     if has_true_label and 'SOC' not in df.columns:
         raise ValueError(f"{path} has no 'SOC' column")
-    if not {'Current', 'Voltage', 'Temperature'}.issubset(df.columns):
-        raise ValueError(f"{path} must contain 'Current', 'Voltage' and 'Temperature' columns")
+    if not {'Current', 'Voltage'}.issubset(df.columns):
+        raise ValueError(f"{path} must contain 'Current' and 'Voltage' columns")
 
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
     df[num_cols] = df[num_cols].interpolate('linear', limit_direction='both')
     df[num_cols] = df[num_cols].fillna(df[num_cols].median(numeric_only=True))
 
-    df['Power_Squared'] = (df['Current'] * df['Voltage']) ** 2
+    df['Power'] = df['Current'] * df['Voltage']
+    df['Power_Squared'] = df['Power'] ** 2
+    
+    if 'Time' in df.columns:
+        dt = df['Time'].diff().fillna(0)
+    else:
+        dt = 1.0 
 
     if has_true_label or 'SOC' in df.columns:
         y = df['SOC'].astype(float).values
@@ -104,19 +132,46 @@ def load_folder(folder: str, has_true_label: bool = True):
 # -------------------------
 # Load model & scaler
 # -------------------------
-def load_model_and_scaler(model_path: str, device: torch.device):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(model_path)
+def load_model_and_scaler(model_dir: str, device: torch.device):
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
+    
+    pth_files = glob.glob(os.path.join(model_dir, "*.pth"))
+    if not pth_files:
+        raise FileNotFoundError(f"No .pth files found in {model_dir}")
+    
+    model_path = None
+    for pth_file in pth_files:
+        if 'best' in os.path.basename(pth_file).lower():
+            model_path = pth_file
+            break
+    
+    if model_path is None:
+        model_path = pth_files[0]
+    
+    print(f"[load] Using model file: {os.path.basename(model_path)}")
+    
+    pkl_files = glob.glob(os.path.join(model_dir, "*.pkl"))
+    if not pkl_files:
+        raise FileNotFoundError(f"No .pkl files found in {model_dir}")
+    
+    scaler_path = None
+    for pkl_file in pkl_files:
+        if 'scaler' in os.path.basename(pkl_file).lower():
+            scaler_path = pkl_file
+            break
+    
+    if scaler_path is None:
+        scaler_path = pkl_files[0]
+    
+    print(f"[load] Using scaler file: {os.path.basename(scaler_path)}")
+    
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
     for k in ['model_state_dict', 'in_dim', 'hidden', 'layers']:
         if k not in ckpt:
             raise ValueError(f"Checkpoint missing key: {k}")
 
-    scaler_path_guess = os.path.join(os.path.dirname(model_path), "best_model_scaler.pkl")
-    if not os.path.exists(scaler_path_guess):
-        raise FileNotFoundError(f"Missing scaler: {scaler_path_guess}")
-
-    with open(scaler_path_guess, 'rb') as f:
+    with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
 
     model = Net(ckpt['in_dim'], 1, ckpt['hidden'], ckpt['layers']).to(device)
@@ -204,7 +259,8 @@ def evaluate_and_save(test_list, preds, outdir: str, has_true_label: bool = True
 # -------------------------
 def main():
     ap = argparse.ArgumentParser("Mamba SOC testing (aligned with training)")
-    ap.add_argument('--model-path', type=str, required=True)
+    ap.add_argument('--model-dir', type=str, required=True,
+                    help='Directory containing model .pth and scaler .pkl files')
     ap.add_argument('--test-dir', type=str, required=True)
     ap.add_argument('--outdir', type=str, default='soc_pred_results_mamba')
     ap.add_argument('--use-cuda', action='store_true')
@@ -219,7 +275,7 @@ def main():
     print(f"true_label = {args.true_label}, plot = {args.plot}")
 
     print("[load] model & scaler")
-    model, scaler = load_model_and_scaler(args.model_path, device)
+    model, scaler = load_model_and_scaler(args.model_dir, device)
 
     print("[load] testing data ...")
     test_list = load_folder(args.test_dir, args.true_label)

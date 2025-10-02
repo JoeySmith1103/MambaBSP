@@ -15,9 +15,6 @@ from mamba import Mamba, MambaConfig
 from scipy.signal import savgol_filter
 
 
-# -------------------------
-# Model (mirror training)
-# -------------------------
 class Net(nn.Module):
     def __init__(self, in_dim, out_dim, hidden, layers):
         super().__init__()
@@ -29,9 +26,9 @@ class Net(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x):                 # x: (B, L, F)
-        y = self.net(x)                   # (B, L, 1)
-        return y[..., 0]                  # (B, L)
+    def forward(self, x):  # x: (B, L, F)
+        y = self.net(x)    # (B, L, 1)
+        return y[..., 0]   # (B, L)
 
 
 # -------------------------
@@ -123,9 +120,40 @@ def load_folder(folder: str, has_true_label: bool = True):
 # -------------------------
 # Load model & scaler
 # -------------------------
-def load_model_and_scaler(model_path: str, device: torch.device):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(model_path)
+def load_model_and_scaler(model_dir: str, device: torch.device):
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
+    
+    pth_files = glob.glob(os.path.join(model_dir, "*.pth"))
+    if not pth_files:
+        raise FileNotFoundError(f"No .pth files found in {model_dir}")
+    
+    model_path = None
+    for pth_file in pth_files:
+        if 'best' in os.path.basename(pth_file).lower():
+            model_path = pth_file
+            break
+    
+    if model_path is None:
+        model_path = pth_files[0]
+    
+    print(f"[load] Using model file: {os.path.basename(model_path)}")
+    
+    pkl_files = glob.glob(os.path.join(model_dir, "*.pkl"))
+    if not pkl_files:
+        raise FileNotFoundError(f"No .pkl files found in {model_dir}")
+    
+    scaler_path = None
+    for pkl_file in pkl_files:
+        if 'scaler' in os.path.basename(pkl_file).lower():
+            scaler_path = pkl_file
+            break
+    
+    if scaler_path is None:
+        scaler_path = pkl_files[0]
+    
+    print(f"[load] Using scaler file: {os.path.basename(scaler_path)}")
+    
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
     for k in ['model_state_dict', 'in_dim', 'hidden', 'layers']:
         if k not in ckpt:
@@ -134,11 +162,7 @@ def load_model_and_scaler(model_path: str, device: torch.device):
     if ckpt.get('task') != 'RUL':
         print(f"[warn] Model task is {ckpt.get('task')}, expected RUL")
 
-    scaler_path_guess = os.path.join(os.path.dirname(model_path), "best_model_scaler.pkl")
-    if not os.path.exists(scaler_path_guess):
-        raise FileNotFoundError(f"Missing scaler: {scaler_path_guess}")
-
-    with open(scaler_path_guess, 'rb') as f:
+    with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
 
     model = Net(ckpt['in_dim'], 1, ckpt['hidden'], ckpt['layers']).to(device)
@@ -212,8 +236,6 @@ def evaluate_and_save(test_list, preds, outdir: str, max_rul_info: dict = None, 
     else:
         # No true labels - just save predictions
         for d, p in zip(test_list, preds):
-            # For RUL, we need to scale back to original units, but without true max_rul
-            # We'll use a default scale or try to estimate from training data
             max_rul = d['max_rul']  # This will be 1.0 by default
             p_orig = p * max_rul
             
@@ -246,7 +268,8 @@ def evaluate_and_save(test_list, preds, outdir: str, max_rul_info: dict = None, 
 # -------------------------
 def main():
     ap = argparse.ArgumentParser("Mamba RUL testing (aligned with training)")
-    ap.add_argument('--model-path', type=str, required=True)
+    ap.add_argument('--model-dir', type=str, required=True,
+                    help='Directory containing model .pth and scaler .pkl files')
     ap.add_argument('--test-dir', type=str, required=True)
     ap.add_argument('--outdir', type=str, default='rul_pred_results')
     ap.add_argument('--use-cuda', action='store_true')
@@ -261,7 +284,7 @@ def main():
     print(f"true_label = {args.true_label}, plot = {args.plot}")
 
     print("[load] model & scaler")
-    model, scaler, max_rul_info = load_model_and_scaler(args.model_path, device)
+    model, scaler, max_rul_info = load_model_and_scaler(args.model_dir, device)
 
     print("[load] testing data ...")
     test_list = load_folder(args.test_dir, args.true_label)
