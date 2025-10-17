@@ -20,12 +20,12 @@ from mamba import Mamba, MambaConfig
 # -------------------------
 parser = argparse.ArgumentParser("Mamba SOC training with data augmentation")
 parser.add_argument('--data-dir', type=str, required=True)
-parser.add_argument('--outdir', type=str, default='soc_model_mamba_augmented')
+parser.add_argument('--outdir', type=str, default='soc_model_mamba')
 
 parser.add_argument('--use-cuda', action='store_true')
 parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--epochs', type=int, default=200)
-parser.add_argument('--lr', type=float, default=0.01)
+parser.add_argument('--epochs', type=int, default=300)
+parser.add_argument('--lr', type=float, default=5e-4)
 parser.add_argument('--wd', type=float, default=1e-5)
 
 parser.add_argument('--hidden-dim', type=int, default=64)
@@ -218,6 +218,20 @@ class Net(nn.Module):
         h = self.feature_refine(h)
         y = self.output_proj(h)
         return y[..., 0]
+    
+    def forward_chunked(self, x, chunk_size=2048):
+        B, L, F = x.shape
+        if L <= chunk_size:
+            return self.forward(x)
+        
+        outputs = []
+        for i in range(0, L, chunk_size):
+            end_idx = min(i + chunk_size, L)
+            chunk = x[:, i:end_idx, :]
+            chunk_out = self.forward(chunk)
+            outputs.append(chunk_out)
+        
+        return torch.cat(outputs, dim=1)
 
 
 # -------------------------
@@ -239,6 +253,9 @@ def train_model(train_list, val_list):
     in_dim = train_list[0]['X'].shape[1]
     model = Net(in_dim=in_dim, out_dim=1, hidden=args.hidden_dim, layers=args.layer_num).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    
+    chunk_size = 1024 
+    max_grad_norm = 1.0
 
     best_val = float('inf')
     os.makedirs(args.outdir, exist_ok=True)
@@ -248,14 +265,19 @@ def train_model(train_list, val_list):
         model.train()
         random.shuffle(train_list)
         train_losses = []
+        
         for d in train_list:
             xt = torch.from_numpy(d['X']).float().unsqueeze(0).to(device)
             yt = torch.from_numpy(d['y']).float().unsqueeze(0).to(device)
-            pred = model(xt)
-            loss = F.l1_loss(pred, yt)
+            
             opt.zero_grad()
+            
+            pred = model.forward_chunked(xt, chunk_size)
+            loss = F.l1_loss(pred, yt)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             opt.step()
+            
             train_losses.append(loss.item())
 
         model.eval()
@@ -264,11 +286,19 @@ def train_model(train_list, val_list):
             for d in val_list:
                 xt = torch.from_numpy(d['X']).float().unsqueeze(0).to(device)
                 yt = torch.from_numpy(d['y']).float().unsqueeze(0).to(device)
-                pred = model(xt)
+                
+                pred = model.forward_chunked(xt, chunk_size)
                 val_losses.append(F.l1_loss(pred, yt).item())
         
         avg_train = np.mean(train_losses)
         avg_val = np.mean(val_losses)
+
+        # NaN 保护：如出现 NaN，跳过保存并降低学习率
+        if (not np.isfinite(avg_train)) or (not np.isfinite(avg_val)):
+            for g in opt.param_groups:
+                g['lr'] = max(g['lr'] * 0.5, 1e-5)
+            print(f"[warn] NaN detected -> reduce lr to {opt.param_groups[0]['lr']:.6f}")
+            continue
 
         if avg_val < best_val:
             best_val = avg_val
