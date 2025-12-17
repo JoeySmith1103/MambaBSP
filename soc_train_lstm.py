@@ -115,8 +115,9 @@ def read_one_csv(path: str):
     y, soc_scale = detect_and_normalize_soc(soc_raw, verbose=True)
     
     drop_cols = ['SOC']
-    if 'Profile' in df.columns:
-        drop_cols.append('Profile')
+    for col in df.columns:
+        if col not in ['Current', 'Voltage', 'Temperature']:
+            drop_cols.append(col)
     X = df.drop(columns=drop_cols).values.astype(float)
 
     finite = np.isfinite(y) & np.all(np.isfinite(X), axis=1)

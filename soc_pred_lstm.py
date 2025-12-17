@@ -79,8 +79,9 @@ def read_one_csv(path: str):
 
     y = df['SOC'].astype(float).values
     drop_cols = ['SOC']
-    if 'Profile' in df.columns:
-        drop_cols.append('Profile')
+    for col in df.columns:
+        if col not in ['Current', 'Voltage', 'Temperature']:
+            drop_cols.append(col)
     X = df.drop(columns=drop_cols).values.astype(float)
 
     finite = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
@@ -107,17 +108,17 @@ def load_folder(folder: str):
 # -------------------------
 # Load model & scaler
 # -------------------------
-def load_model_and_scaler(model_path: str, device: torch.device):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(model_path)
-    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+def load_model_and_scaler(model_dir: str, device: torch.device):
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(model_dir)
+    ckpt = torch.load(os.path.join(model_dir, "best_model.pth"), map_location='cpu', weights_only=False)
     
     required_keys = ['model_state_dict', 'in_dim', 'hidden_size', 'num_layers']
     for k in required_keys:
         if k not in ckpt:
             raise ValueError(f"Checkpoint missing key: {k}")
 
-    scaler_path_guess = os.path.join(os.path.dirname(model_path), "best_model_scaler.pkl")
+    scaler_path_guess = os.path.join(os.path.dirname(model_dir), "best_model_scaler.pkl")
     if not os.path.exists(scaler_path_guess):
         raise FileNotFoundError(f"Missing scaler: {scaler_path_guess}")
 
@@ -202,7 +203,7 @@ def evaluate_and_save(test_list, preds, outdir: str):
 # -------------------------
 def main():
     ap = argparse.ArgumentParser("LSTM SOC testing (aligned with training)")
-    ap.add_argument('--model-path', type=str, required=True, 
+    ap.add_argument('--model-dir', type=str, required=True, 
                     help='Path to trained LSTM model (.pth file)')
     ap.add_argument('--test-dir', type=str, required=True,
                     help='Directory containing test CSV files')
@@ -215,8 +216,8 @@ def main():
     device = torch.device('cuda' if (args.use_cuda and torch.cuda.is_available()) else 'cpu')
 
     try:
-        model, scaler = load_model_and_scaler(args.model_path, device)
-        print(f"LSTM model: {args.model_path}")
+        model, scaler = load_model_and_scaler(args.model_dir, device)
+        print(f"LSTM model: {args.model_dir}")
     except Exception as e:
         print(f"Load model failed: {e}")
         return
