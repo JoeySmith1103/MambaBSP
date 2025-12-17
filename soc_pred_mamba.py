@@ -94,8 +94,9 @@ def read_one_csv(path: str, has_true_label: bool = True):
         y = None
         drop_cols = []
         
-    if 'Profile' in df.columns:
-        drop_cols.append('Profile')
+    for col in df.columns:
+        if col not in ['Current', 'Voltage', 'Temperature', 'Power', 'Power_Squared']:
+            drop_cols.append(col)
     X = df.drop(columns=drop_cols).values.astype(float)
 
     if has_true_label:
