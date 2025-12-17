@@ -33,6 +33,7 @@ parser.add_argument('--layer-num', type=int, default=2)
 
 parser.add_argument('--min-seq-len', type=int, default=300)
 parser.add_argument('--num-augment', type=int, default=6)
+parser.add_argument('--accum-steps', type=int, default=8, help="Gradient accumulation steps")
 
 args = parser.parse_args()
 device = torch.device('cuda' if (args.use_cuda and torch.cuda.is_available()) else 'cpu')
@@ -100,10 +101,9 @@ def read_one_csv(path: str):
     y, _ = detect_and_normalize_soc(soc_raw, verbose=True)
     
     drop_cols = ['SOC']
-    if 'Profile' in df.columns:
-        drop_cols.append('Profile')
-    if 'Time' in df.columns:
-        drop_cols.append('Time')
+    for col in df.columns:
+        if col not in ['Current', 'Voltage', 'Temperature', 'Power', 'Power_Squared']:
+            drop_cols.append(col)
     
     X = df.drop(columns=drop_cols, errors='ignore').values.astype(float)
 
@@ -135,9 +135,10 @@ def augment_data(X, y, num_augment, min_seq_len):
     return augmented
 
 
-def load_folder_with_augmentation(folder: str, num_augment, min_seq_len):
+def process_files(file_list, num_augment, min_seq_len, desc="Data"):
     data = []
-    for f in find_csvs(folder):
+    print(f"\n[{desc}] Processing {len(file_list)} files...")
+    for f in file_list:
         try:
             X, y, name = read_one_csv(f)
             if len(y) == 0:
@@ -153,32 +154,35 @@ def load_folder_with_augmentation(folder: str, num_augment, min_seq_len):
                     'X': X_aug,
                     'y': y_aug
                 })
-                if idx == 0:
-                    print(f"[load] {name:20s} -> X{X_aug.shape}, SOC{soc_range}")
-                else:
-                    print(f"  [aug{idx}] {name:20s} -> X{X_aug.shape}, SOC{soc_range}")
+                # Optional: reduce verbosity if too many files
+                # if idx == 0:
+                #     print(f"[load] {name:20s} -> X{X_aug.shape}, SOC{soc_range}")
                     
         except Exception as e:
             print(f"[warn] skip {f}: {e}")
-    
-    if not data:
-        raise ValueError(f"No valid CSVs in {folder}")
-    
-    print(f"\n[augment] origin file num: {len(find_csvs(folder))}, after augmentation: {len(data)}")
+            
+    print(f"[{desc}] Done. Total sequences: {len(data)}")
     return data
 
 
-def split_train_val_by_file(data, ratio=0.2, seed=42):
+def get_train_val_data(folder: str, ratio=0.2, seed=42, num_augment=6, min_seq_len=300):
+    all_files = find_csvs(folder)
+    
+    # 1. Split by filename first to prevent leakage
     rng = np.random.default_rng(seed)
-    idx = np.arange(len(data))
-    rng.shuffle(idx)
-    n_val = max(1, int(len(idx) * ratio))
-    val_idx = set(idx[:n_val])
-    tr, va = [], []
-    for i, d in enumerate(data):
-        (va if i in val_idx else tr).append(d)
-    print(f"[split] train={len(tr)} sequences, val={len(va)} sequences")
-    return tr, va
+    rng.shuffle(all_files)
+    
+    n_val = max(1, int(len(all_files) * ratio))
+    val_files = all_files[:n_val]
+    train_files = all_files[n_val:]
+    
+    print(f"[split] Total files: {len(all_files)} -> Train: {len(train_files)}, Val: {len(val_files)}")
+    
+    # 2. Process and augment
+    train_data = process_files(train_files, num_augment, min_seq_len, desc="Train")
+    val_data = process_files(val_files, num_augment, min_seq_len, desc="Val")
+    
+    return train_data, val_data
 
 
 # -------------------------
@@ -238,11 +242,31 @@ class Net(nn.Module):
 # Training
 # -------------------------
 def train_model(train_list, val_list):
+    # Memory efficient scaling: use partial_fit
     Scaler = RobustScaler
     scaler = Scaler()
-    Xcat = np.concatenate([d['X'] for d in train_list], axis=0)
-    scaler.fit(Xcat)
+    
+    print("[Scaler] Fitting scaler with partial_fit...")
+    
+    # Strategy: Concatenate a subset (e.g. 100k points) for fitting RobustScaler to save memory
+    sample_size = 100000
+    all_X = []
+    total_points = 0
+    for d in train_list:
+        if total_points < sample_size:
+            all_X.append(d['X'])
+            total_points += d['X'].shape[0]
+        else:
+            break
+    
+    if all_X:
+        scaler.fit(np.concatenate(all_X, axis=0))
+        print(f"[Scaler] Fitted RobustScaler on {total_points} samples.")
+    else:
+        # Fallback if empty
+        scaler.fit(np.zeros((1, train_list[0]['X'].shape[1])))
 
+    # Transform in place to save memory
     for d in train_list:
         d['X'] = scaler.transform(d['X'])
         d['X'][~np.isfinite(d['X'])] = 0.0
@@ -256,6 +280,7 @@ def train_model(train_list, val_list):
     
     chunk_size = 1024 
     max_grad_norm = 1.0
+    accum_steps = args.accum_steps
 
     best_val = float('inf')
     os.makedirs(args.outdir, exist_ok=True)
@@ -266,19 +291,32 @@ def train_model(train_list, val_list):
         random.shuffle(train_list)
         train_losses = []
         
-        for d in train_list:
+        opt.zero_grad()
+        
+        for i, d in enumerate(train_list):
             xt = torch.from_numpy(d['X']).float().unsqueeze(0).to(device)
             yt = torch.from_numpy(d['y']).float().unsqueeze(0).to(device)
             
-            opt.zero_grad()
-            
             pred = model.forward_chunked(xt, chunk_size)
             loss = F.l1_loss(pred, yt)
+            
+            # Normalize loss for accumulation
+            loss = loss / accum_steps
             loss.backward()
+            
+            if (i + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                opt.step()
+                opt.zero_grad()
+            
+            # Record the actual loss (un-normalized)
+            train_losses.append(loss.item() * accum_steps)
+
+        # Handle remaining gradients
+        if len(train_list) % accum_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             opt.step()
-            
-            train_losses.append(loss.item())
+            opt.zero_grad()
 
         model.eval()
         val_losses = []
@@ -293,7 +331,7 @@ def train_model(train_list, val_list):
         avg_train = np.mean(train_losses)
         avg_val = np.mean(val_losses)
 
-        # NaN 保护：如出现 NaN，跳过保存并降低学习率
+        # NaN protection
         if (not np.isfinite(avg_train)) or (not np.isfinite(avg_val)):
             for g in opt.param_groups:
                 g['lr'] = max(g['lr'] * 0.5, 1e-5)
@@ -324,18 +362,20 @@ def train_model(train_list, val_list):
 # -------------------------
 def main():
     print("[Data Augmentation Mode]")
-    print(f"[config] every file generate {args.num_augment} subsequences（different initial SOC）")
+    print(f"[config] every file generate {args.num_augment} subsequences")
     print(f"[config] subseq min len: {args.min_seq_len}")
     print(f"[config] Hidden: {args.hidden_dim}, Layers: {args.layer_num}")
+    print(f"[config] Accumulation Steps: {args.accum_steps}")
     print()
     
-    all_list = load_folder_with_augmentation(
+    train_list, val_list = get_train_val_data(
         args.data_dir, 
+        ratio=0.2, 
+        seed=args.seed,
         num_augment=args.num_augment,
         min_seq_len=args.min_seq_len
     )
     
-    train_list, val_list = split_train_val_by_file(all_list, ratio=0.2, seed=args.seed)
     train_model(train_list, val_list)
 
 
